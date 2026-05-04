@@ -1,0 +1,23 @@
+[Unit]
+Description=OSELOT Satellite Ground Station Watcher
+After=network.target goesproc.service
+Requires=goesproc.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/oselot/watcher.py --config /etc/oselot/oselot.conf
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oselot
+
+# Lock the daemon down a little. The watcher only needs read access to the
+# goesproc output dir, scp out to a remote host, and write to /var/log
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
