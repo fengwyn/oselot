@@ -298,17 +298,31 @@ def _setup_logging(level: str, log_file: Optional[str]) -> None:
 
 
 def _build_publisher(cfg: Config) -> irc_publisher.IRCPublisher:
-    """Build the IRC publisher. The integrator should replace
-    `_DefaultClientAdapter` with the real OSELOT IRC client - either by
-    editing this function or by pointing it at the real module:
+    """Build the IRC publisher.
 
-        from oselot_irc_client import Client
-        return irc_publisher.IRCPublisher(client=Client(), ...)
+    Two modes:
+      - eirc (default): real eIRC TCP+packet client; publishes to a Node
+        room, no manual setup beyond the address in oselot.conf.
+      - stub: discards messages to the journal; useful for end-to-end
+        tests without a running Node.
     """
-    return irc_publisher.make_default_publisher(
+    mode = cfg.get("irc", "mode", default="eirc").lower()
+    if mode == "stub":
+        return irc_publisher.make_default_publisher(
+            server=cfg.get("irc", "server"),
+            port=cfg.get("irc", "port", cast=int),
+            channel=cfg.get("irc", "channel", default="(unused)"),
+            nick=cfg.get("irc", "nick"),
+        )
+
+    import eirc_client
+    return irc_publisher.IRCPublisher(
+        client=eirc_client.EIRCClient(),
         server=cfg.get("irc", "server"),
         port=cfg.get("irc", "port", cast=int),
-        channel=cfg.get("irc", "channel"),
+        # eIRC has no channels; pass a placeholder so IRCPublisher can
+        # still address sends. The eIRC adapter ignores the channel arg.
+        channel=cfg.get("irc", "channel", default="(node)"),
         nick=cfg.get("irc", "nick"),
         reconnect_delay_sec=cfg.get(
             "irc", "reconnect_delay_sec", default=10, cast=int),
