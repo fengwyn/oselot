@@ -28,6 +28,7 @@ import logging.handlers
 import os
 import signal
 import sys
+import threading
 import time
 from typing import Iterable, Optional, Set, Tuple
 
@@ -127,13 +128,29 @@ def _sibling_json(jpg_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 class Pipeline:
-    def __init__(self, config: Config, publisher: irc_publisher.IRCPublisher) -> None:
+    def __init__(self, config: Config, publisher: irc_publisher.IRCPublisher,
+                 force_scp: bool = False) -> None:
         self.cfg = config
         self.publisher = publisher
-        self.method = config.get("transport", "image_method", default="scp").lower()
-        if self.method not in ("scp", "irc_chunked"):
-            log.warning("unknown image_method=%r; defaulting to scp", self.method)
+        if force_scp:
             self.method = "scp"
+            return
+        # SCP is opt-in via the --scp / -S CLI flag only. The config's
+        # image_method controls only the non-SCP fallback. If the config
+        # asks for scp without the flag, warn and use irc_chunked - never
+        # initiate scp implicitly.
+        configured = config.get(
+            "transport", "image_method", default="irc_chunked").lower()
+        if configured == "scp":
+            log.warning(
+                "config has image_method=scp but --scp flag not given; "
+                "using irc_chunked instead")
+            self.method = "irc_chunked"
+        elif configured == "irc_chunked":
+            self.method = "irc_chunked"
+        else:
+            log.warning("unknown image_method=%r; using irc_chunked", configured)
+            self.method = "irc_chunked"
 
     def process(self, jpg_path: str) -> None:
         json_path = _sibling_json(jpg_path)
@@ -231,7 +248,7 @@ def _scan_existing(directory: str) -> Set[str]:
     return seen
 
 
-def _watch_inotify(directory: str, on_jpg) -> None:
+def _watch_inotify(directory: str, on_jpg, stop: "threading.Event") -> None:
     INotify, flags = _try_import_inotify()
     if INotify is None:
         raise RuntimeError("inotify_simple not available")
@@ -244,19 +261,23 @@ def _watch_inotify(directory: str, on_jpg) -> None:
     inotify.add_watch(directory, watch_flags)
     log.info("inotify watching %s", directory)
 
-    while True:
-        for event in inotify.read(timeout=2000):
+    while not stop.is_set():
+        # 1s timeout caps shutdown latency at ~1s after SIGINT/SIGTERM.
+        for event in inotify.read(timeout=1000):
             if not event.name.endswith(".jpg"):
                 continue
             path = os.path.join(directory, event.name)
             on_jpg(path)
+            if stop.is_set():
+                return
 
 
-def _watch_polling(directory: str, interval: float, on_jpg) -> None:
+def _watch_polling(directory: str, interval: float, on_jpg,
+                   stop: "threading.Event") -> None:
     log.info("polling %s every %.1fs", directory, interval)
     seen = _scan_existing(directory)
     log.info("ignoring %d pre-existing jpg files at startup", len(seen))
-    while True:
+    while not stop.is_set():
         try:
             current = {
                 os.path.join(directory, n)
@@ -265,13 +286,19 @@ def _watch_polling(directory: str, interval: float, on_jpg) -> None:
             }
         except FileNotFoundError:
             log.warning("watch dir vanished: %s", directory)
-            time.sleep(interval)
+            if stop.wait(interval):
+                return
             continue
         new = current - seen
         for path in sorted(new):
             on_jpg(path)
+            if stop.is_set():
+                return
         seen = current
-        time.sleep(interval)
+        # Event.wait returns True the moment stop is set, so shutdown is
+        # immediate rather than waiting out the full poll interval.
+        if stop.wait(interval):
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -298,17 +325,31 @@ def _setup_logging(level: str, log_file: Optional[str]) -> None:
 
 
 def _build_publisher(cfg: Config) -> irc_publisher.IRCPublisher:
-    """Build the IRC publisher. The integrator should replace
-    `_DefaultClientAdapter` with the real OSELOT IRC client - either by
-    editing this function or by pointing it at the real module:
+    """Build the IRC publisher.
 
-        from oselot_irc_client import Client
-        return irc_publisher.IRCPublisher(client=Client(), ...)
+    Two modes:
+      - eirc (default): real eIRC TCP+packet client; publishes to a Node
+        room, no manual setup beyond the address in oselot.conf.
+      - stub: discards messages to the journal; useful for end-to-end
+        tests without a running Node.
     """
-    return irc_publisher.make_default_publisher(
+    mode = cfg.get("irc", "mode", default="eirc").lower()
+    if mode == "stub":
+        return irc_publisher.make_default_publisher(
+            server=cfg.get("irc", "server"),
+            port=cfg.get("irc", "port", cast=int),
+            channel=cfg.get("irc", "channel", default="(unused)"),
+            nick=cfg.get("irc", "nick"),
+        )
+
+    import eirc_client
+    return irc_publisher.IRCPublisher(
+        client=eirc_client.EIRCClient(),
         server=cfg.get("irc", "server"),
         port=cfg.get("irc", "port", cast=int),
-        channel=cfg.get("irc", "channel"),
+        # eIRC has no channels; pass a placeholder so IRCPublisher can
+        # still address sends. The eIRC adapter ignores the channel arg.
+        channel=cfg.get("irc", "channel", default="(node)"),
         nick=cfg.get("irc", "nick"),
         reconnect_delay_sec=cfg.get(
             "irc", "reconnect_delay_sec", default=10, cast=int),
@@ -318,6 +359,11 @@ def _build_publisher(cfg: Config) -> irc_publisher.IRCPublisher:
 def main() -> int:
     parser = argparse.ArgumentParser(description="OSELOT goesproc watcher")
     parser.add_argument("--config", required=True, help="path to oselot.conf")
+    parser.add_argument(
+        "-S", "--scp", action="store_true",
+        help="Ship images via SCP to the archive host configured in [scp]. "
+             "Without this flag the image transport defaults to irc_chunked "
+             "(stream over eIRC), regardless of [transport].image_method.")
     args = parser.parse_args()
 
     cfg = Config(args.config)
@@ -338,7 +384,11 @@ def main() -> int:
     except Exception as exc:
         log.warning("initial IRC connect failed (%s); will retry on first send", exc)
 
-    pipeline = Pipeline(cfg, publisher)
+    pipeline = Pipeline(cfg, publisher, force_scp=args.scp)
+    if args.scp:
+        log.info("--scp flag set: image transport forced to scp")
+    else:
+        log.info("image transport: %s (use --scp to enable SCP)", pipeline.method)
 
     def on_jpg(path: str) -> None:
         try:
@@ -347,27 +397,28 @@ def main() -> int:
             # Final safety net - the watcher must never die from one bad file.
             log.exception("pipeline crashed on %s: %s", path, exc)
 
-    stop = {"flag": False}
+    stop = threading.Event()
 
     def _on_signal(signum, _frame):
         log.info("signal %d received, shutting down", signum)
-        stop["flag"] = True
+        stop.set()
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
     use_inotify = _try_import_inotify()[0] is not None
-    while not stop["flag"]:
+    while not stop.is_set():
         try:
             if use_inotify:
-                _watch_inotify(output_dir, on_jpg)
+                _watch_inotify(output_dir, on_jpg, stop)
             else:
-                _watch_polling(output_dir, poll_interval, on_jpg)
+                _watch_polling(output_dir, poll_interval, on_jpg, stop)
         except KeyboardInterrupt:
             break
         except Exception as exc:
             log.exception("watch loop crashed: %s; restarting in 5s", exc)
-            time.sleep(5)
+            if stop.wait(5):
+                break
 
     publisher.disconnect()
     return 0
