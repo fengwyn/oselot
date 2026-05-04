@@ -32,7 +32,13 @@ to configure.
 | [oselot.conf](oselot.conf) | Documented example INI config |
 | [oselot-watcher.service](oselot-watcher.service) | systemd unit |
 
-## Setup
+
+
+## Running from user-space
+python3 watcher.py --config ./oselot.conf
+
+
+## Setup for Daemon
 
 ```sh
 # On the BeaglePlay
@@ -100,10 +106,10 @@ client.disconnect()                               -> None
 4. Every subsequent message is `build_packet(nick, body)` where `body`
    is the `[OSELOT]` or `[OSELOT-XFER]` line.
 
-### Nick policy
+### Nickname policy
 
 The Node enforces an `oselot*` prefix on lines starting with `[OSELOT]`
-or `[OSELOT-XFER]` (see `node.cpp` "OSELOT feed: nick-restricted
+or `[OSELOT-XFER]` (see `node.cpp` "OSELOT feed: nickname-restricted
 ingestion"). Any other nick gets the line silently dropped and an
 `ERROR` packet bounced back. [eirc_client.py](eirc_client.py) refuses
 to connect with a non-`oselot*` nick to make misconfiguration obvious
@@ -300,3 +306,13 @@ arrives at the remote and a metadata line is logged
 - **Receiver writes nothing:** verify the END line matches a BEGIN
   filename and `status=ok`; missing chunks are reported as
   `END ... missing N chunks`.
+
+## Testing 
+
+Generating dummy pair-files
+
+
+TS=$(date +%s)
+BASE="/data/goes/images/test_${TS}_GOES19_FD_CH13"
+printf '{"timestamp":"2026-05-04T15:40:00Z","satellite_id":"GOES19","region":"FD","channel":"13"}\n' > "${BASE}.json"
+dd if=/dev/urandom of="${BASE}.jpg" bs=1k count=8 status=none

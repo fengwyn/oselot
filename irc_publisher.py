@@ -103,7 +103,10 @@ class IRCPublisher:
         """Format `meta` as an [OSELOT] line and send it. Returns True on
         success, False on failure (caller decides whether to retry)."""
         line = self._format_metadata(meta)
-        return self._send_to(self._channel, line)
+        ok = self._send_to(self._channel, line)
+        if ok:
+            log.info("published: %s", line)
+        return ok
 
     def send_raw(self, text: str, channel: Optional[str] = None) -> bool:
         """Send an arbitrary line to `channel` (default: the metadata
